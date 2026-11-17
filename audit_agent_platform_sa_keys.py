@@ -59,9 +59,10 @@ INFERENCE_PERMISSIONS = (
     "aiplatform.endpoints.predict",
     "aiplatform.batchPredictionJobs.create",
 )
+SERVICE_ENABLE_PERMISSION = "serviceusage.services.enable"
+VALIDATION_SWEEP_MAX_CALLS = 10
 
-# Métodos RPC de inferência do Vertex AI registrados em `serviceruntime` (`consumed_api`).
-# Exclui métodos administrativos de leitura como GetEndpoint, ListModels, ListLocations.
+# Métodos RPC de inferência do Vertex AI / Agent Platform registrados em `serviceruntime` (`consumed_api`).
 VERTEX_INFERENCE_METHOD_SUFFIXES = (
     "generatecontent",
     "streamgeneratecontent",
@@ -80,6 +81,22 @@ VERTEX_INFERENCE_METHOD_SUFFIXES = (
     "embedcontent",
     "generatevideo",
 )
+
+# Métodos RPC de reconhecimento / Target Scoping documentados pelo GTIG / Mandiant (Nov/2026).
+VERTEX_RECON_METHOD_SUFFIXES = (
+    "listmodels",
+    "getmodel",
+    "listendpoints",
+    "getendpoint",
+    "listpublishermodels",
+    "getpublishermodel",
+)
+
+KNOWN_CAN_ENABLE_AI_ROLES = frozenset({
+    "roles/owner",
+    "roles/editor",
+    "roles/serviceusage.serviceUsageAdmin",
+})
 
 KNOWN_INFERENCE_ROLES = frozenset({
     "roles/owner",
@@ -189,14 +206,17 @@ class AccessGrant:
 
 @dataclass
 class SAInferenceTelemetry:
-    """Telemetria agregada de chamadas reais ao Vertex AI por Service Account."""
+    """Telemetria agregada de chamadas reais e reconhecimento ao Agent Platform / Vertex AI por SA."""
 
     total_calls: int = 0
     ok_2xx_calls: int = 0
     error_calls: int = 0
+    recon_calls: int = 0
     methods: set[str] = field(default_factory=set)
+    recon_methods: set[str] = field(default_factory=set)
     active_vertex_projects: set[str] = field(default_factory=set)
     iam_insight_exercised_90d: bool = False
+    admin_activity_signals: set[str] = field(default_factory=set)
 
 
 @dataclass
@@ -226,6 +246,9 @@ class AuditFinding:
     binding_resources: list[str]
     conditions: list[str]
     disable_key_command: str
+    sa_recon_calls_window: int = 0
+    sa_recon_methods_called: list[str] = field(default_factory=list)
+    gtig_threat_signals: list[str] = field(default_factory=list)
 
 
 class GcloudError(RuntimeError):
@@ -390,6 +413,13 @@ def is_vertex_inference_method(method_name: str) -> bool:
     return short in VERTEX_INFERENCE_METHOD_SUFFIXES
 
 
+def is_vertex_recon_method(method_name: str) -> bool:
+    if not method_name:
+        return False
+    short = method_name.rsplit(".", 1)[-1].rsplit("/", 1)[-1].lower()
+    return short in VERTEX_RECON_METHOD_SUFFIXES
+
+
 def short_method_name(method_name: str) -> str:
     return method_name.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
 
@@ -527,6 +557,7 @@ def match_resource_to_vertex_projects(
     vertex_projects: list[ProjectInfo],
     id_to_proj: dict[str, ProjectInfo],
     num_to_proj: dict[str, ProjectInfo],
+    allow_inactive_ai: bool = False,
 ) -> list[str]:
     m_org = ORG_RESOURCE_RE.match(resource_full_name)
     if m_org:
@@ -548,15 +579,73 @@ def match_resource_to_vertex_projects(
     if m_proj:
         ident = m_proj.group(1)
         proj = id_to_proj.get(ident) or num_to_proj.get(ident)
-        return [proj.project_id] if proj and proj.vertex_enabled else []
+        return (
+            [proj.project_id]
+            if proj and (proj.vertex_enabled or allow_inactive_ai)
+            else []
+        )
 
     m_child = CHILD_PROJECT_RESOURCE_RE.match(resource_full_name)
     if m_child:
         ident = m_child.group(1)
         proj = id_to_proj.get(ident) or num_to_proj.get(ident)
-        return [proj.project_id] if proj and proj.vertex_enabled else []
+        return (
+            [proj.project_id]
+            if proj and (proj.vertex_enabled or allow_inactive_ai)
+            else []
+        )
 
     return []
+
+
+def _resolve_effective_grants(
+    raw_grants: list[AccessGrant],
+    id_to_proj: dict[str, ProjectInfo],
+    include_can_enable_ai: bool = False,
+) -> list[AccessGrant]:
+    """Filtra bindings efetivos de inferência e (opcionalmente) habilitação latente de IA."""
+    grouped: dict[tuple[str, str], list[AccessGrant]] = {}
+    for g in raw_grants:
+        grouped.setdefault((g.sa_email, g.vertex_project_id), []).append(g)
+
+    resolved: list[AccessGrant] = []
+    inference_set = set(INFERENCE_PERMISSIONS)
+
+    for (_sa_email, proj_id), group in grouped.items():
+        all_perms = {p for g in group for p in g.permissions}
+        if any(g.role in KNOWN_CAN_ENABLE_AI_ROLES for g in group):
+            all_perms.add(SERVICE_ENABLE_PERMISSION)
+
+        if not (all_perms & inference_set):
+            continue
+
+        proj = id_to_proj.get(proj_id)
+        is_ai_active = bool(proj and proj.vertex_enabled)
+
+        if is_ai_active:
+            for g in group:
+                if set(g.permissions) & inference_set:
+                    resolved.append(g)
+        elif include_can_enable_ai and SERVICE_ENABLE_PERMISSION in all_perms:
+            for g in group:
+                new_path = (
+                    f"{g.access_path}+LATENT_CAN_ENABLE_AI"
+                    if g.access_path.startswith("IMPERSONATION->")
+                    else "LATENT_CAN_ENABLE_AI"
+                )
+                resolved.append(
+                    AccessGrant(
+                        sa_email=g.sa_email,
+                        vertex_project_id=g.vertex_project_id,
+                        role=g.role,
+                        permissions=g.permissions,
+                        attached_resource=g.attached_resource,
+                        access_path=new_path,
+                        condition_expression=g.condition_expression,
+                    )
+                )
+
+    return resolved
 
 
 def extract_grants_from_cai_analysis(
@@ -564,6 +653,7 @@ def extract_grants_from_cai_analysis(
     vertex_projects: list[ProjectInfo],
     id_to_proj: dict[str, ProjectInfo],
     num_to_proj: dict[str, ProjectInfo],
+    include_can_enable_ai: bool = False,
 ) -> tuple[list[AccessGrant], bool]:
     if isinstance(analysis_response, list):
         analysis_response = analysis_response[0] if analysis_response else {}
@@ -575,7 +665,7 @@ def extract_grants_from_cai_analysis(
 
     grants: list[AccessGrant] = []
     target_sa_to_projects: dict[str, set[str]] = {}
-    target_sa_to_perms: dict[str, set[str]] = {}
+    target_sa_proj_perms: dict[tuple[str, str], set[str]] = {}
 
     for res in main_analysis.get("analysisResults") or []:
         attached = res.get("attachedResourceFullName", "")
@@ -587,7 +677,11 @@ def extract_grants_from_cai_analysis(
         perms: set[str] = set()
         affected_projects: set[str] = set(
             match_resource_to_vertex_projects(
-                attached, vertex_projects, id_to_proj, num_to_proj
+                attached,
+                vertex_projects,
+                id_to_proj,
+                num_to_proj,
+                allow_inactive_ai=include_can_enable_ai,
             )
         )
 
@@ -610,7 +704,11 @@ def extract_grants_from_cai_analysis(
                 r_name = r_obj.get("fullResourceName", "")
                 affected_projects.update(
                     match_resource_to_vertex_projects(
-                        r_name, vertex_projects, id_to_proj, num_to_proj
+                        r_name,
+                        vertex_projects,
+                        id_to_proj,
+                        num_to_proj,
+                        allow_inactive_ai=include_can_enable_ai,
                     )
                 )
 
@@ -625,18 +723,21 @@ def extract_grants_from_cai_analysis(
             if name.startswith("deleted:"):
                 continue
             if name in ("allUsers", "allAuthenticatedUsers"):
-                print(
-                    f"[ALERTA CRÍTICO] Acesso público (`{name}`) detectado com permissão de inferência em {sorted(affected_projects)} ({attached})!",
-                    file=sys.stderr,
-                )
+                if set(perm_list) & set(INFERENCE_PERMISSIONS):
+                    print(
+                        f"[ALERTA CRÍTICO] Acesso público (`{name}`) detectado com permissão de inferência em {sorted(affected_projects)} ({attached})!",
+                        file=sys.stderr,
+                    )
                 continue
             if name.startswith("serviceAccount:"):
                 sa_email = name.split(":", 1)[1]
                 target_sa_to_projects.setdefault(sa_email, set()).update(
                     affected_projects
                 )
-                target_sa_to_perms.setdefault(sa_email, set()).update(perm_list)
                 for v_proj in sorted(affected_projects):
+                    target_sa_proj_perms.setdefault(
+                        (sa_email, v_proj), set()
+                    ).update(perm_list)
                     grants.append(
                         AccessGrant(
                             sa_email=sa_email,
@@ -662,9 +763,6 @@ def extract_grants_from_cai_analysis(
         m_target = re.search(r"/serviceAccounts/([^/]+)$", query_res)
         target_sa = m_target.group(1) if m_target else ""
         inherited_projs = target_sa_to_projects.get(target_sa, set())
-        inherited_perms = sorted(
-            target_sa_to_perms.get(target_sa, set(INFERENCE_PERMISSIONS))
-        )
         if not inherited_projs:
             continue
 
@@ -684,6 +782,11 @@ def extract_grants_from_cai_analysis(
                 if caller_sa == target_sa:
                     continue
                 for v_proj in sorted(inherited_projs):
+                    inherited_perms = sorted(
+                        target_sa_proj_perms.get(
+                            (target_sa, v_proj), set(INFERENCE_PERMISSIONS)
+                        )
+                    )
                     grants.append(
                         AccessGrant(
                             sa_email=caller_sa,
@@ -696,7 +799,12 @@ def extract_grants_from_cai_analysis(
                         )
                     )
 
-    return grants, fully_explored
+    return (
+        _resolve_effective_grants(
+            grants, id_to_proj, include_can_enable_ai=include_can_enable_ai
+        ),
+        fully_explored,
+    )
 
 
 def run_cai_discovery(
@@ -704,6 +812,7 @@ def run_cai_discovery(
     scope: str,
     include_impersonation: bool = False,
     include_genai_api: bool = False,
+    include_can_enable_ai: bool = False,
 ) -> tuple[
     dict[str, ProjectInfo],
     dict[str, list[SAKeyInfo]],
@@ -810,11 +919,19 @@ def run_cai_discovery(
             p_info.vertex_enabled = True
 
     vertex_projects = [p for p in id_to_proj.values() if p.vertex_enabled]
+    candidate_projects = (
+        list(id_to_proj.values()) if include_can_enable_ai else vertex_projects
+    )
     print(
         f"      -> {len(vertex_projects)} de {len(id_to_proj)} projeto(s) ativo(s) possuem Agent Platform (`{VERTEX_SERVICE_NAME}`) habilitado.",
         file=sys.stderr,
     )
-    if not vertex_projects:
+    if include_can_enable_ai:
+        print(
+            f"      -> `--include-can-enable-ai` ativo: avaliando também {len(id_to_proj) - len(vertex_projects)} projeto(s) sem IA ativa onde chaves possam habilitar a API.",
+            file=sys.stderr,
+        )
+    if not candidate_projects:
         return id_to_proj, {}, [], scanned_project_ids, {}
 
     print(
@@ -874,11 +991,16 @@ def run_cai_discovery(
         "(incluindo grupos, custom roles e herança)...",
         file=sys.stderr,
     )
+    query_perms = (
+        (*INFERENCE_PERMISSIONS, SERVICE_ENABLE_PERMISSION)
+        if include_can_enable_ai
+        else INFERENCE_PERMISSIONS
+    )
     analyze_args = [
         "asset",
         "analyze-iam-policy",
         analyzer_scope_flag,
-        f"--permissions={','.join(INFERENCE_PERMISSIONS)}",
+        f"--permissions={','.join(query_perms)}",
         "--expand-groups",
         "--execution-timeout=300s",
         "--show-response",
@@ -889,7 +1011,11 @@ def run_cai_discovery(
     try:
         analysis_resp = runner.run_json(analyze_args, timeout=360)
         grants, fully_explored = extract_grants_from_cai_analysis(
-            analysis_resp, vertex_projects, id_to_proj, num_to_proj
+            analysis_resp,
+            candidate_projects,
+            id_to_proj,
+            num_to_proj,
+            include_can_enable_ai=include_can_enable_ai,
         )
         if not fully_explored:
             print(
@@ -907,7 +1033,12 @@ def run_cai_discovery(
             file=sys.stderr,
         )
         grants = fallback_search_all_iam_policies(
-            runner, scope, vertex_projects, id_to_proj, num_to_proj
+            runner,
+            scope,
+            candidate_projects,
+            id_to_proj,
+            num_to_proj,
+            include_can_enable_ai=include_can_enable_ai,
         )
 
     return (
@@ -925,6 +1056,7 @@ def fallback_search_all_iam_policies(
     vertex_projects: list[ProjectInfo],
     id_to_proj: dict[str, ProjectInfo],
     num_to_proj: dict[str, ProjectInfo],
+    include_can_enable_ai: bool = False,
 ) -> list[AccessGrant]:
     """Fallback gratuito via `gcloud asset search-all-iam-policies` (400 req/min,
     isento do limite de 20 queries/dia sem SCC Premium/Enterprise).
@@ -939,13 +1071,19 @@ def fallback_search_all_iam_policies(
         ],
         timeout=300,
     )
-    role_cache = RolePermissionCache(runner)
+    role_cache = RolePermissionCache(
+        runner, include_can_enable_ai=include_can_enable_ai
+    )
     grants: list[AccessGrant] = []
 
     for item in raw_policies:
         attached = item.get("resource", "")
         affected = match_resource_to_vertex_projects(
-            attached, vertex_projects, id_to_proj, num_to_proj
+            attached,
+            vertex_projects,
+            id_to_proj,
+            num_to_proj,
+            allow_inactive_ai=include_can_enable_ai,
         )
         if not affected:
             continue
@@ -974,12 +1112,17 @@ def fallback_search_all_iam_policies(
                             condition_expression=cond_expr,
                         )
                     )
-    return grants
+    return _resolve_effective_grants(
+        grants, id_to_proj, include_can_enable_ai=include_can_enable_ai
+    )
 
 
 class RolePermissionCache:
-    def __init__(self, runner: GcloudRunner) -> None:
+    def __init__(
+        self, runner: GcloudRunner, include_can_enable_ai: bool = False
+    ) -> None:
         self.runner = runner
+        self.include_can_enable_ai = include_can_enable_ai
         self._cache: dict[str, list[str]] = {}
 
     def get_inference_permissions(self, role: str) -> list[str]:
@@ -987,18 +1130,26 @@ class RolePermissionCache:
             return self._cache[role]
         if role in KNOWN_INFERENCE_ROLES:
             perms = list(INFERENCE_PERMISSIONS)
+            if self.include_can_enable_ai and role in KNOWN_CAN_ENABLE_AI_ROLES:
+                perms.append(SERVICE_ENABLE_PERMISSION)
+            self._cache[role] = perms
+            return perms
+        if self.include_can_enable_ai and role in KNOWN_CAN_ENABLE_AI_ROLES:
+            perms = [SERVICE_ENABLE_PERMISSION]
             self._cache[role] = perms
             return perms
         if role in KNOWN_NON_INFERENCE_ROLES:
             self._cache[role] = []
             return []
 
+        role_lower = role.lower()
         should_inspect = (
             role.startswith("projects/")
             or role.startswith("organizations/")
-            or "aiplatform" in role.lower()
-            or "vertex" in role.lower()
-            or "ml." in role.lower()
+            or "aiplatform" in role_lower
+            or "vertex" in role_lower
+            or "ml." in role_lower
+            or (self.include_can_enable_ai and "serviceusage" in role_lower)
         )
         if not should_inspect:
             self._cache[role] = []
@@ -1020,10 +1171,15 @@ class RolePermissionCache:
         else:
             cmd.append(role)
 
+        target_perms = (
+            (*INFERENCE_PERMISSIONS, SERVICE_ENABLE_PERMISSION)
+            if self.include_can_enable_ai
+            else INFERENCE_PERMISSIONS
+        )
         try:
             desc = self.runner.run_json(cmd, timeout=60)
             inc = set(desc.get("includedPermissions") or [])
-            matched = [p for p in INFERENCE_PERMISSIONS if p in inc]
+            matched = [p for p in target_perms if p in inc]
         except GcloudError:
             matched = []
 
@@ -1077,6 +1233,7 @@ def run_direct_discovery(
     runner: GcloudRunner,
     project_ids: list[str],
     include_genai_api: bool = False,
+    include_can_enable_ai: bool = False,
     workers: int = 8,
 ) -> tuple[
     dict[str, ProjectInfo],
@@ -1133,21 +1290,26 @@ def run_direct_discovery(
                     num_to_proj[res.project_number] = res
 
     vertex_projects = [p for p in id_to_proj.values() if p.vertex_enabled]
+    candidate_projects = (
+        list(id_to_proj.values()) if include_can_enable_ai else vertex_projects
+    )
     print(
         f"      -> {len(vertex_projects)} projeto(s) possuem Vertex AI habilitado.",
         file=sys.stderr,
     )
-    if not vertex_projects:
+    if not candidate_projects:
         return id_to_proj, {}, [], set(), set()
 
     print(
         "[2/3] Coletando políticas IAM (incluindo ancestrais, se permitido)...",
         file=sys.stderr,
     )
-    role_cache = RolePermissionCache(runner)
-    grants: list[AccessGrant] = []
+    role_cache = RolePermissionCache(
+        runner, include_can_enable_ai=include_can_enable_ai
+    )
+    raw_grants: list[AccessGrant] = []
 
-    for p_info in vertex_projects:
+    for p_info in candidate_projects:
         pid = p_info.project_id
         policy_entries: list[tuple[str, dict[str, Any]]] = []
         try:
@@ -1190,7 +1352,7 @@ def run_direct_discovery(
                         continue
                     if member.startswith("serviceAccount:"):
                         sa_email = member.split(":", 1)[1]
-                        grants.append(
+                        raw_grants.append(
                             AccessGrant(
                                 sa_email=sa_email,
                                 vertex_project_id=pid,
@@ -1208,6 +1370,9 @@ def run_direct_discovery(
                             file=sys.stderr,
                         )
 
+    grants = _resolve_effective_grants(
+        raw_grants, id_to_proj, include_can_enable_ai=include_can_enable_ai
+    )
     candidate_sas = sorted({
         g.sa_email for g in grants if not is_google_managed_agent(g.sa_email)
     })
@@ -1374,18 +1539,24 @@ def enrich_with_inference_telemetry_no_dataread(
     email_to_unique_id: dict[str, str],
     lookback_days: int = 14,
     check_iam_insights: bool = True,
+    check_admin_activity: bool = True,
     now: datetime | None = None,
     workers: int = 6,
 ) -> dict[str, SAInferenceTelemetry]:
-    """Comprova chamadas de inferência SEM precisar de logs DATA_READ.
+    """Comprova chamadas de inferência, reconhecimento e Admin Activity SEM exigir DATA_READ.
 
     1) `serviceruntime.googleapis.com/api/request_count` (`consumed_api`):
-       mede chamadas de inferência a `aiplatform.googleapis.com` por
-       `credential_id` (`serviceaccount:<uniqueId>`) e método RPC.
+       mede chamadas de inferência e Target Scoping (`ListModels`, `ListEndpoints`,
+       `ListPublisherModels`) a `aiplatform.googleapis.com` por `credential_id`
+       (`serviceaccount:<uniqueId>`) e método RPC.
     2) `iam.googleapis.com/service_account/key/authn_events_count`:
        mede autenticações por `key_id` específica na mesma janela.
     3) `google.iam.policy.Insight` (`exercisedPermissions`):
        confirma se `aiplatform.endpoints.predict` foi exercida nos últimos 90d.
+    4) `cloudaudit.googleapis.com%2Factivity` (Admin Activity Logs, gratuito/padrão):
+       detecta habilitação recente de APIs de IA (`EnableService`) e persistência
+       lateral (`CreateServiceAccountKey`, `CreateServiceAccount`, `ApiKeys.CreateKey`,
+       injeção de metadados SSH em Compute Engine).
     """
     ref_now = now or datetime.now(timezone.utc)
     start_dt = ref_now - timedelta(days=lookback_days)
@@ -1410,7 +1581,7 @@ def enrich_with_inference_telemetry_no_dataread(
             continue
         for g in sa_grants:
             if g.access_path.startswith("IMPERSONATION->"):
-                target_sa = g.access_path.split("->", 1)[1]
+                target_sa = g.access_path.split("->", 1)[1].split("+", 1)[0]
                 impersonated_targets.setdefault(sa, set()).add(target_sa)
                 target_to_callers.setdefault(target_sa, set()).add(sa)
 
@@ -1446,6 +1617,7 @@ def enrich_with_inference_telemetry_no_dataread(
     sa_home_projects = sorted({
         k.sa_project_id
         for k in exposed_keys
+        for _ in (0,)
         if k.sa_project_id and not k.sa_project_id.startswith("project-number:")
     })
     monitoring_api_projects = sorted(
@@ -1454,7 +1626,7 @@ def enrich_with_inference_telemetry_no_dataread(
 
     if monitoring_api_projects and uid_to_sas:
         print(
-            f"[+] Verificando chamadas REAIS de inferência Vertex AI (Cloud Monitoring `serviceruntime`, "
+            f"[+] Verificando chamadas REAIS de inferência e Target Scoping (Cloud Monitoring `serviceruntime`, "
             f"últimos {lookback_days}d, sem DATA_READ) em {len(monitoring_api_projects)} projeto(s)...",
             file=sys.stderr,
         )
@@ -1503,7 +1675,11 @@ def enrich_with_inference_telemetry_no_dataread(
                         continue
                     uid = cred_id.split(":", 1)[1]
                     matched_sas = uid_to_sas.get(uid)
-                    if not matched_sas or not is_vertex_inference_method(method):
+                    if not matched_sas:
+                        continue
+                    is_inf = is_vertex_inference_method(method)
+                    is_rec = False if is_inf else is_vertex_recon_method(method)
+                    if not is_inf and not is_rec:
                         continue
 
                     count = _sum_timeseries_points(ts.get("points") or [])
@@ -1512,13 +1688,18 @@ def enrich_with_inference_telemetry_no_dataread(
 
                     for sa_email in matched_sas:
                         tel = telemetry_by_sa[sa_email]
-                        tel.total_calls += count
-                        if resp_class == "2xx" or not resp_class:
-                            tel.ok_2xx_calls += count
+                        if is_inf:
+                            tel.total_calls += count
+                            if resp_class == "2xx" or not resp_class:
+                                tel.ok_2xx_calls += count
+                            else:
+                                tel.error_calls += count
+                            tel.methods.add(short_method_name(method))
+                            tel.active_vertex_projects.add(pid)
                         else:
-                            tel.error_calls += count
-                        tel.methods.add(short_method_name(method))
-                        tel.active_vertex_projects.add(pid)
+                            tel.recon_calls += count
+                            tel.recon_methods.add(short_method_name(method))
+                            tel.active_vertex_projects.add(pid)
 
     if sa_home_projects:
         print(
@@ -1626,6 +1807,102 @@ def enrich_with_inference_telemetry_no_dataread(
                                 caller_sa
                             ].iam_insight_exercised_90d = True
 
+    if check_admin_activity and monitoring_api_projects:
+        print(
+            f"[+] Consultando Admin Activity Logs (`EnableService`, criação de chaves/SAs, SSH metadata, "
+            f"últimos {lookback_days}d) em {len(monitoring_api_projects)} projeto(s)...",
+            file=sys.stderr,
+        )
+        admin_filter = (
+            'logName:"cloudaudit.googleapis.com%2Factivity" '
+            f'AND timestamp>="{start_iso}" '
+            "AND protoPayload.methodName=("
+            '"google.api.serviceusage.v1.ServiceUsage.EnableService" OR '
+            '"google.api.serviceusage.v1.ServiceUsage.BatchEnableServices" OR '
+            '"google.iam.admin.v1.CreateServiceAccountKey" OR '
+            '"google.iam.admin.v1.CreateServiceAccount" OR '
+            '"google.api.apikeys.v2.ApiKeys.CreateKey" OR '
+            '"v1.compute.projects.setCommonInstanceMetadata" OR '
+            '"v1.compute.instances.setMetadata"'
+            ")"
+        )
+
+        def query_admin_logs(proj_id: str) -> list[dict[str, Any]]:
+            try:
+                res = runner.run_json(
+                    [
+                        "logging",
+                        "read",
+                        admin_filter,
+                        f"--project={proj_id}",
+                        "--limit=200",
+                    ],
+                    timeout=60,
+                )
+                return res if isinstance(res, list) else []
+            except GcloudError as exc:
+                if runner.verbose:
+                    print(
+                        f"[DEBUG] Sem acesso a Admin Activity Logs em `{proj_id}`: {exc}",
+                        file=sys.stderr,
+                    )
+                return []
+
+        recent_ai_enabled_projects: set[str] = set()
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            fut_map = {
+                pool.submit(query_admin_logs, pid): pid
+                for pid in monitoring_api_projects
+            }
+            for fut in as_completed(fut_map):
+                pid = fut_map[fut]
+                for entry in fut.result():
+                    payload = entry.get("protoPayload") or {}
+                    method = str(payload.get("methodName") or "")
+                    short_m = short_method_name(method)
+                    principal = str(
+                        (payload.get("authenticationInfo") or {}).get(
+                            "principalEmail"
+                        )
+                        or ""
+                    )
+                    res_name = str(payload.get("resourceName") or "")
+                    req_obj = payload.get("request") or {}
+
+                    if principal in telemetry_by_sa and short_m:
+                        telemetry_by_sa[principal].admin_activity_signals.add(
+                            f"SA_ADMIN_ACTION:{short_m}@{pid}"
+                        )
+                    for caller_sa, targets in impersonated_targets.items():
+                        if principal in targets and caller_sa in telemetry_by_sa and short_m:
+                            telemetry_by_sa[
+                                caller_sa
+                            ].admin_activity_signals.add(
+                                f"IMPERSONATED_SA_ADMIN_ACTION:{short_m}@{pid}"
+                            )
+
+                    if short_m in ("EnableService", "BatchEnableServices"):
+                        svc_candidates = [
+                            res_name,
+                            str(req_obj.get("name") or ""),
+                            *[str(s) for s in (req_obj.get("serviceIds") or [])],
+                        ]
+                        if any(
+                            VERTEX_SERVICE_NAME in c or GENAI_SERVICE_NAME in c
+                            for c in svc_candidates
+                        ):
+                            recent_ai_enabled_projects.add(pid)
+
+        if recent_ai_enabled_projects:
+            for sa_email in exposed_sas:
+                sa_projs = {
+                    g.vertex_project_id for g in grants_by_sa.get(sa_email, [])
+                }
+                for enabled_pid in sorted(sa_projs & recent_ai_enabled_projects):
+                    telemetry_by_sa[sa_email].admin_activity_signals.add(
+                        f"RECENT_AI_API_ENABLED:{enabled_pid}"
+                    )
+
     return telemetry_by_sa
 
 
@@ -1645,7 +1922,7 @@ def classify_inference_activity(
     lookback_days: int,
     now: datetime | None = None,
 ) -> str:
-    """Classifica o status operacional real da chave em relação à inferência Vertex."""
+    """Classifica o status operacional real da chave em relação à inferência e recon Vertex."""
     ref_now = now or datetime.now(timezone.utc)
     window_start = ref_now - timedelta(days=lookback_days)
     key_used_recently = _is_key_used_in_window(key, window_start)
@@ -1664,6 +1941,12 @@ def classify_inference_activity(
         # mas o IAM ainda não individualizou `key_id` (até 3h de delay p/ chaves recém-usadas)
         # ou o uso veio de credencial anexada (GCE/GKE WIF).
         return "SA_ACTIVE_VERIFY_KEY"
+    if tel.recon_calls > 0 and key_used_recently:
+        return "RECON_SCOPING_ACTIVE_KEY"
+    if tel.recon_calls > 0 and other_sibling_used:
+        return "SA_RECON_KEY_IDLE"
+    if tel.recon_calls > 0:
+        return "RECON_SCOPING_VERIFY_KEY"
     if key_used_recently:
         return "KEY_AUTH_NO_INFERENCE"
     return "DORMANT_NO_ACTIVITY"
@@ -1682,10 +1965,13 @@ def build_findings(
     check_last_used: bool = True,
     check_inference_usage: bool = True,
     check_iam_insights: bool = True,
+    check_admin_activity: bool = True,
     lookback_days: int = 14,
     now: datetime | None = None,
 ) -> list[AuditFinding]:
     """Correlaciona permissões efetivas, chaves USER_MANAGED e telemetria real de inferência."""
+    ref_now = now or datetime.now(timezone.utc)
+    window_start = ref_now - timedelta(days=lookback_days)
     email_uid_map = dict(email_to_unique_id or {})
     num_to_id = {
         p.project_number: p.project_id
@@ -1740,7 +2026,8 @@ def build_findings(
             email_to_unique_id=email_uid_map,
             lookback_days=lookback_days,
             check_iam_insights=check_iam_insights,
-            now=now,
+            check_admin_activity=check_admin_activity,
+            now=ref_now,
         )
 
     findings: list[AuditFinding] = []
@@ -1761,6 +2048,11 @@ def build_findings(
         home_proj = infer_sa_home_project(sa_email, num_to_id)
 
         if sa_email in unverified_external_sas:
+            ext_signals = (
+                ["LATENT_CAN_ENABLE_AI_API"]
+                if any("LATENT_CAN_ENABLE_AI" in p for p in paths)
+                else []
+            )
             findings.append(
                 AuditFinding(
                     risk_status="EXTERNAL_SA_VERIFY_MANUALLY",
@@ -1791,6 +2083,7 @@ def build_findings(
                         f"# Verifique a SA externa `{sa_email}` no projeto `{home_proj}` "
                         "ou remova o binding IAM nos projetos Vertex."
                     ),
+                    gtig_threat_signals=ext_signals,
                 )
             )
             continue
@@ -1803,7 +2096,7 @@ def build_findings(
 
             act_status = (
                 classify_inference_activity(
-                    k, sa_keys_list, tel, lookback_days, now=now
+                    k, sa_keys_list, tel, lookback_days, now=ref_now
                 )
                 if check_inference_usage
                 else "NOT_CHECKED"
@@ -1823,6 +2116,28 @@ def build_findings(
             else:
                 risk = f"LOW_{k.status}_KEY"
                 disable_cmd = f"# Chave {k.key_id} já está {k.status}"
+
+            gtig_signals: list[str] = []
+            if (
+                check_inference_usage
+                and 1 <= tel.total_calls <= VALIDATION_SWEEP_MAX_CALLS
+                and act_status != "SA_INFERENCE_KEY_IDLE"
+            ):
+                gtig_signals.append("POSSIBLE_VALIDATION_SWEEP_1_TO_10_CALLS")
+            if (
+                check_inference_usage
+                and tel.recon_calls > 0
+                and act_status not in ("SA_INFERENCE_KEY_IDLE", "SA_RECON_KEY_IDLE")
+            ):
+                gtig_signals.append(
+                    f"TARGET_SCOPING_RECON({','.join(sorted(tel.recon_methods))})"
+                )
+            created_dt = parse_iso_timestamp(k.valid_after_time)
+            if created_dt is not None and created_dt >= window_start:
+                gtig_signals.append("RECENT_KEY_CREATED_IN_WINDOW")
+            if any("LATENT_CAN_ENABLE_AI" in p for p in paths):
+                gtig_signals.append("LATENT_CAN_ENABLE_AI_API")
+            gtig_signals.extend(sorted(tel.admin_activity_signals))
 
             findings.append(
                 AuditFinding(
@@ -1853,6 +2168,9 @@ def build_findings(
                     binding_resources=resources,
                     conditions=conditions,
                     disable_key_command=disable_cmd,
+                    sa_recon_calls_window=tel.recon_calls,
+                    sa_recon_methods_called=sorted(tel.recon_methods),
+                    gtig_threat_signals=gtig_signals,
                 )
             )
 
@@ -1866,16 +2184,19 @@ def build_findings(
     activity_rank = {
         "CONFIRMED_KEY_INFERENCE": 0,
         "SA_ACTIVE_VERIFY_KEY": 1,
-        "SA_INFERENCE_KEY_IDLE": 2,
-        "KEY_AUTH_NO_INFERENCE": 3,
-        "DORMANT_NO_ACTIVITY": 4,
-        "UNKNOWN_EXTERNAL_SA": 5,
-        "NOT_CHECKED": 6,
+        "RECON_SCOPING_ACTIVE_KEY": 2,
+        "RECON_SCOPING_VERIFY_KEY": 3,
+        "SA_INFERENCE_KEY_IDLE": 4,
+        "SA_RECON_KEY_IDLE": 5,
+        "KEY_AUTH_NO_INFERENCE": 6,
+        "DORMANT_NO_ACTIVITY": 7,
+        "UNKNOWN_EXTERNAL_SA": 8,
+        "NOT_CHECKED": 9,
     }
 
     def sort_key(
         f: AuditFinding,
-    ) -> tuple[int, int, int, int, float, str, str]:
+    ) -> tuple[int, int, int, int, int, float, str, str]:
         dt = parse_iso_timestamp(f.last_authenticated_time)
         has_auth_rank = 0 if dt is not None else 1
         neg_ts = -dt.timestamp() if dt is not None else 0.0
@@ -1883,6 +2204,7 @@ def build_findings(
             priority_rank.get(f.risk_status, 9),
             activity_rank.get(f.inference_activity_status, 9),
             -f.sa_vertex_inference_calls_window,
+            -f.sa_recon_calls_window,
             has_auth_rank,
             neg_ts,
             f.sa_email,
@@ -1928,6 +2250,11 @@ def print_summary_table(findings: list[AuditFinding], lookback_days: int) -> Non
         authn_str = f"{f.key_authn_events_window:,}"
         if f.sa_vertex_methods_called:
             detail = f"{','.join(f.sa_vertex_methods_called[:2])} @ {','.join(f.active_inference_projects[:2])}"
+        elif f.sa_recon_methods_called:
+            detail = (
+                f"RECON:{','.join(f.sa_recon_methods_called[:2])}({f.sa_recon_calls_window}) "
+                f"@ {','.join(f.active_inference_projects[:2])}"
+            )
         else:
             detail = f"Permissão em: {','.join(f.vertex_projects_permitted[:2])}"
         sa_disp = (
@@ -1941,6 +2268,26 @@ def print_summary_table(findings: list[AuditFinding], lookback_days: int) -> Non
             f"{calls_str:>15} {authn_str:>10} {last_used:<21} {detail}"
         )
     print("=" * 136)
+
+    flagged = [f for f in findings if f.gtig_threat_signals]
+    if flagged:
+        print(
+            f"⚠️  SINAIS TÁTICOS GTIG / MANDIANT DETECTADOS EM {len(flagged)} CHAVE(S):"
+        )
+        for f in flagged[:10]:
+            short_key = f.key_id[:12] if len(f.key_id) > 12 else f.key_id
+            print(
+                f"   - {f.sa_email} (key `{short_key}`): {', '.join(f.gtig_threat_signals)}"
+            )
+        if any(
+            "POSSIBLE_VALIDATION_SWEEP_1_TO_10_CALLS" in f.gtig_threat_signals
+            for f in flagged
+        ):
+            print(
+                "   [!] ATENÇÃO: Baixo volume (1–10 chamadas) pode indicar 'Validation Sweep' (teste de 1 token) "
+                "para enfileirar a credencial como reserva em proxies LLM Mixer (`new-api` / `gcli2api`). Não ignore como ruído!"
+            )
+        print("=" * 136)
 
 
 def write_reports(
@@ -1964,8 +2311,11 @@ def write_reports(
             "sa_vertex_2xx_calls_window",
             "sa_vertex_error_calls_window",
             "sa_vertex_methods_called",
+            "sa_recon_calls_window",
+            "sa_recon_methods_called",
             "active_inference_projects",
             "iam_exercised_predict_90d",
+            "gtig_threat_signals",
             "vertex_projects_permitted",
             "access_paths",
             "roles",
@@ -1981,7 +2331,9 @@ def write_reports(
                 row = asdict(f)
                 for list_col in (
                     "sa_vertex_methods_called",
+                    "sa_recon_methods_called",
                     "active_inference_projects",
+                    "gtig_threat_signals",
                     "vertex_projects_permitted",
                     "access_paths",
                     "roles",
@@ -2004,6 +2356,9 @@ def write_reports(
             ),
             "active_keys_with_vertex_permission": sum(
                 1 for f in findings if f.key_status == "ACTIVE"
+            ),
+            "keys_with_gtig_threat_signals": sum(
+                1 for f in findings if f.gtig_threat_signals
             ),
             "findings": [asdict(f) for f in findings],
         }
@@ -2062,7 +2417,10 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--only-confirmed-inference",
         action="store_true",
-        help="Exibe e exporta APENAS chaves com chamadas de inferência confirmadas (`CONFIRMED_KEY_INFERENCE`).",
+        help=(
+            "Exibe e exporta APENAS chaves com chamadas reais de inferência ou "
+            "reconhecimento/scoping detectados na janela."
+        ),
     )
     parser.add_argument(
         "--skip-inference-usage",
@@ -2075,9 +2433,22 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Pula a consulta complementar de 90 dias ao IAM Policy Insights (`recommender.googleapis.com`).",
     )
     parser.add_argument(
+        "--skip-admin-activity",
+        action="store_true",
+        help="Pula a consulta de sinais de persistência e EnableService nos Admin Activity Logs.",
+    )
+    parser.add_argument(
         "--include-impersonation",
         action="store_true",
         help="(Modo CAI) Inclui SAs com chave que podem impersonar outra SA com acesso ao Agent Platform / Vertex AI.",
+    )
+    parser.add_argument(
+        "--include-can-enable-ai",
+        action="store_true",
+        help=(
+            "Inclui também projetos onde `aiplatform.googleapis.com` está desabilitado, mas a SA possui "
+            "simultaneamente `serviceusage.services.enable` e permissão de inferência (vetor GTIG de auto-habilitação)."
+        ),
     )
     parser.add_argument(
         "--include-genai-api",
@@ -2162,6 +2533,7 @@ def main(argv: list[str] | None = None) -> int:
                     scope=sc,
                     include_impersonation=args.include_impersonation,
                     include_genai_api=args.include_genai_api,
+                    include_can_enable_ai=args.include_can_enable_ai,
                 )
                 merged_projs.update(p_map)
                 merged_email_uid.update(email_uid)
@@ -2184,6 +2556,7 @@ def main(argv: list[str] | None = None) -> int:
                 check_last_used=not args.skip_last_used,
                 check_inference_usage=not args.skip_inference_usage,
                 check_iam_insights=not args.skip_iam_insights,
+                check_admin_activity=not args.skip_admin_activity,
                 lookback_days=lookback,
             )
         else:
@@ -2217,6 +2590,7 @@ def main(argv: list[str] | None = None) -> int:
                     runner=runner,
                     project_ids=project_ids,
                     include_genai_api=args.include_genai_api,
+                    include_can_enable_ai=args.include_can_enable_ai,
                 )
             )
             findings = build_findings(
@@ -2231,6 +2605,7 @@ def main(argv: list[str] | None = None) -> int:
                 check_last_used=not args.skip_last_used,
                 check_inference_usage=not args.skip_inference_usage,
                 check_iam_insights=not args.skip_iam_insights,
+                check_admin_activity=not args.skip_admin_activity,
                 lookback_days=lookback,
             )
 
@@ -2239,7 +2614,12 @@ def main(argv: list[str] | None = None) -> int:
                 f
                 for f in findings
                 if f.inference_activity_status
-                in ("CONFIRMED_KEY_INFERENCE", "SA_ACTIVE_VERIFY_KEY")
+                in (
+                    "CONFIRMED_KEY_INFERENCE",
+                    "SA_ACTIVE_VERIFY_KEY",
+                    "RECON_SCOPING_ACTIVE_KEY",
+                    "RECON_SCOPING_VERIFY_KEY",
+                )
             ]
 
         print_summary_table(findings, lookback_days=lookback)

@@ -52,6 +52,7 @@ import urllib.request
 
 GENAI_SERVICE = "generativelanguage.googleapis.com"
 VERTEX_SERVICE = "aiplatform.googleapis.com"
+VALIDATION_SWEEP_MAX_CALLS = 10
 
 # Métodos RPC de inferência/geração em generativelanguage.googleapis.com (e aiplatform)
 GENAI_INFERENCE_METHOD_SUFFIXES = (
@@ -72,6 +73,18 @@ GENAI_INFERENCE_METHOD_SUFFIXES = (
     "streamrawpredict",
     "chatcompletions",
     "generatevideo",
+)
+
+# Métodos RPC de reconhecimento / Target Scoping documentados pelo GTIG / Mandiant (Nov/2026)
+GENAI_RECON_METHOD_SUFFIXES = (
+    "listmodels",
+    "getmodel",
+    "listtunedmodels",
+    "gettunedmodel",
+    "listpublishermodels",
+    "getpublishermodel",
+    "listendpoints",
+    "getendpoint",
 )
 
 
@@ -106,7 +119,9 @@ class KeyCallTelemetry:
     total_calls: int = 0
     ok_2xx_calls: int = 0
     error_calls: int = 0
+    recon_calls: int = 0
     methods: set[str] = field(default_factory=set)
+    recon_methods: set[str] = field(default_factory=set)
     services_used: set[str] = field(default_factory=set)
 
 
@@ -129,6 +144,9 @@ class ApiKeyFinding:
     methods_called: list[str]
     enabled_ai_apis: list[str]
     containment_command: str
+    recon_calls_window: int = 0
+    recon_methods_called: list[str] = field(default_factory=list)
+    gtig_threat_signals: list[str] = field(default_factory=list)
 
 
 class GcloudError(RuntimeError):
@@ -268,8 +286,30 @@ def is_genai_inference_method(method_name: str) -> bool:
     return short in GENAI_INFERENCE_METHOD_SUFFIXES
 
 
+def is_genai_recon_method(method_name: str) -> bool:
+    if not method_name:
+        return False
+    short = method_name.rsplit(".", 1)[-1].rsplit("/", 1)[-1].lower()
+    return short in GENAI_RECON_METHOD_SUFFIXES
+
+
 def short_method_name(method_name: str) -> str:
     return method_name.rsplit(".", 1)[-1].rsplit("/", 1)[-1]
+
+
+def parse_iso_timestamp(ts: str) -> datetime | None:
+    if not ts:
+        return None
+    cleaned = ts.strip()
+    if cleaned.endswith("Z"):
+        cleaned = cleaned[:-1] + "+00:00"
+    try:
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt
+    except ValueError:
+        return None
 
 
 def evaluate_key_restrictions(
@@ -771,7 +811,9 @@ def enrich_api_keys_with_monitoring(
                 svc = r_labels.get("service", "")
                 resp_class = m_labels.get("response_code_class", "")
 
-                if not is_genai_inference_method(method):
+                is_inf = is_genai_inference_method(method)
+                is_rec = False if is_inf else is_genai_recon_method(method)
+                if not is_inf and not is_rec:
                     continue
 
                 matched_uids: set[str] = set()
@@ -792,12 +834,16 @@ def enrich_api_keys_with_monitoring(
 
                 for k_uid in matched_uids:
                     tel = telemetry_by_uid[k_uid]
-                    tel.total_calls += cnt
-                    if resp_class == "2xx" or not resp_class:
-                        tel.ok_2xx_calls += cnt
+                    if is_inf:
+                        tel.total_calls += cnt
+                        if resp_class == "2xx" or not resp_class:
+                            tel.ok_2xx_calls += cnt
+                        else:
+                            tel.error_calls += cnt
+                        tel.methods.add(short_method_name(method))
                     else:
-                        tel.error_calls += cnt
-                    tel.methods.add(short_method_name(method))
+                        tel.recon_calls += cnt
+                        tel.recon_methods.add(short_method_name(method))
                     if svc:
                         tel.services_used.add(svc)
 
@@ -809,7 +855,11 @@ def build_api_key_findings(
     records: list[ApiKeyRecord],
     telemetry_by_uid: dict[str, KeyCallTelemetry],
     check_usage: bool = True,
+    lookback_days: int = 14,
+    now: datetime | None = None,
 ) -> list[ApiKeyFinding]:
+    ref_now = now or datetime.now(timezone.utc)
+    window_start = ref_now - timedelta(days=lookback_days)
     findings: list[ApiKeyFinding] = []
     for r in records:
         p_info = id_to_proj[r.project_id]
@@ -825,6 +875,8 @@ def build_api_key_findings(
             act_status = "NOT_CHECKED"
         elif tel.total_calls > 0:
             act_status = "CONFIRMED_KEY_INFERENCE"
+        elif tel.recon_calls > 0:
+            act_status = "RECON_SCOPING_DETECTED"
         else:
             act_status = "EXPOSED_NO_RECENT_CALLS"
 
@@ -839,6 +891,17 @@ def build_api_key_findings(
             risk = "HIGH_OPEN_KEY_UNKNOWN_BILLING"
         else:
             risk = "MODERATE_CLIENT_RESTRICTED_KEY"
+
+        gtig_signals: list[str] = []
+        if check_usage and 1 <= tel.total_calls <= VALIDATION_SWEEP_MAX_CALLS:
+            gtig_signals.append("POSSIBLE_VALIDATION_SWEEP_1_TO_10_CALLS")
+        if check_usage and tel.recon_calls > 0:
+            gtig_signals.append(
+                f"TARGET_SCOPING_RECON({','.join(sorted(tel.recon_methods))})"
+            )
+        created_dt = parse_iso_timestamp(r.create_time)
+        if created_dt is not None and created_dt >= window_start:
+            gtig_signals.append("RECENT_API_KEY_CREATED_IN_WINDOW")
 
         # Contenção reversível: bloqueia tráfego externo restringindo a chave p/ loopback 127.0.0.1
         # (ou `api-keys delete`, que possui janela de 30 dias para `undelete`).
@@ -866,6 +929,9 @@ def build_api_key_findings(
                 methods_called=sorted(tel.methods),
                 enabled_ai_apis=enabled_apis,
                 containment_command=contain_cmd,
+                recon_calls_window=tel.recon_calls,
+                recon_methods_called=sorted(tel.recon_methods),
+                gtig_threat_signals=gtig_signals,
             )
         )
 
@@ -880,6 +946,7 @@ def build_api_key_findings(
         key=lambda f: (
             rank.get(f.risk_status, 9),
             -f.inference_calls_window,
+            -f.recon_calls_window,
             f.project_id,
             f.key_uid,
         )
@@ -926,6 +993,25 @@ def print_summary(findings: list[ApiKeyFinding], lookback_days: int) -> None:
         )
     print("=" * 138)
 
+    flagged = [f for f in findings if f.gtig_threat_signals]
+    if flagged:
+        print(
+            f"⚠️  SINAIS TÁTICOS GTIG / MANDIANT DETECTADOS EM {len(flagged)} API KEY(S):"
+        )
+        for f in flagged[:10]:
+            print(
+                f"   - {f.project_id} / `{f.key_uid[:12]}`: {', '.join(f.gtig_threat_signals)}"
+            )
+        if any(
+            "POSSIBLE_VALIDATION_SWEEP_1_TO_10_CALLS" in f.gtig_threat_signals
+            for f in flagged
+        ):
+            print(
+                "   [!] ATENÇÃO: Baixo volume (1–10 chamadas) pode indicar 'Validation Sweep' (teste de 1 token) "
+                "para enfileirar a credencial como reserva em proxies LLM Mixer (`new-api` / `gcli2api`). Não ignore como ruído!"
+            )
+        print("=" * 138)
+
 
 def write_reports(
     findings: list[ApiKeyFinding], csv_path: str, json_path: str
@@ -947,6 +1033,9 @@ def write_reports(
             "ok_2xx_calls_window",
             "error_calls_window",
             "methods_called",
+            "recon_calls_window",
+            "recon_methods_called",
+            "gtig_threat_signals",
             "enabled_ai_apis",
             "containment_command",
         ]
@@ -956,6 +1045,12 @@ def write_reports(
             for f in findings:
                 row = asdict(f)
                 row["methods_called"] = "; ".join(row["methods_called"])
+                row["recon_methods_called"] = "; ".join(
+                    row["recon_methods_called"]
+                )
+                row["gtig_threat_signals"] = "; ".join(
+                    row["gtig_threat_signals"]
+                )
                 row["enabled_ai_apis"] = "; ".join(row["enabled_ai_apis"])
                 writer.writerow(row)
         print(f"[+] Relatório CSV salvo em: {csv_path}", file=sys.stderr)
@@ -971,6 +1066,9 @@ def write_reports(
             ),
             "critical_payg_open_keys": sum(
                 1 for f in findings if f.risk_status == "CRITICAL_PAYG_OPEN_KEY"
+            ),
+            "keys_with_gtig_threat_signals": sum(
+                1 for f in findings if f.gtig_threat_signals
             ),
             "findings": [asdict(f) for f in findings],
         }
@@ -1137,12 +1235,14 @@ def main(argv: list[str] | None = None) -> int:
             merged_records,
             tel_map,
             check_usage=not args.skip_inference_usage,
+            lookback_days=lookback,
         )
         if args.only_confirmed_inference:
             findings = [
                 f
                 for f in findings
-                if f.inference_activity_status == "CONFIRMED_KEY_INFERENCE"
+                if f.inference_activity_status
+                in ("CONFIRMED_KEY_INFERENCE", "RECON_SCOPING_DETECTED")
             ]
 
         print_summary(findings, lookback_days=lookback)

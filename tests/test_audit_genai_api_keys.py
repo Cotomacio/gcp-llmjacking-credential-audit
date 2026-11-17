@@ -120,6 +120,99 @@ class AuditGenaiApiKeysTest(unittest.TestCase):
         self.assertEqual(findings[1].risk_status, "CRITICAL_PAYG_OPEN_KEY")
         self.assertEqual(findings[2].risk_status, "MEDIUM_FREE_TIER_KEY")
 
+    def test_gtig_recon_and_validation_sweep_signals(self):
+        ref_now = datetime(2026, 11, 14, 12, 0, 0, tzinfo=timezone.utc)
+        proj = gk.GenAIProjectInfo(
+            project_id="p-mixer",
+            project_number="333",
+            genai_enabled=True,
+            billing_enabled="TRUE",
+        )
+        records = [
+            gk.ApiKeyRecord(
+                project_id="p-mixer",
+                project_number="333",
+                uid="uid-sweep-recent",
+                display_name="Sweep Key",
+                create_time="2026-11-12T10:00:00Z",
+                update_time="2026-11-12T10:00:00Z",
+                api_scope_status="UNRESTRICTED_ALL_APIS",
+                target_services=["*"],
+                client_restriction_type="OPEN_ANY_IP_OR_APP",
+                client_restriction_detail="None",
+            ),
+            gk.ApiKeyRecord(
+                project_id="p-mixer",
+                project_number="333",
+                uid="uid-recon-only",
+                display_name="Recon Key",
+                create_time="2025-05-01T00:00:00Z",
+                update_time="2025-05-01T00:00:00Z",
+                api_scope_status="EXPLICIT_GENAI_TARGET",
+                target_services=["generativelanguage.googleapis.com"],
+                client_restriction_type="OPEN_ANY_IP_OR_APP",
+                client_restriction_detail="None",
+            ),
+        ]
+
+        runner = FakeRunner({
+            "p-mixer": [
+                {
+                    "resource": {
+                        "labels": {
+                            "credential_id": "apikey:uid-sweep-recent",
+                            "service": "generativelanguage.googleapis.com",
+                            "method": "google.ai.generativelanguage.v1beta.GenerativeService.GenerateContent",
+                        }
+                    },
+                    "metric": {"labels": {"response_code_class": "2xx"}},
+                    "points": [{"value": {"int64Value": "2"}}],
+                },
+                {
+                    "resource": {
+                        "labels": {
+                            "credential_id": "apikey:uid-recon-only",
+                            "service": "generativelanguage.googleapis.com",
+                            "method": "google.ai.generativelanguage.v1beta.ModelService.ListModels",
+                        }
+                    },
+                    "metric": {"labels": {"response_code_class": "2xx"}},
+                    "points": [{"value": {"int64Value": "6"}}],
+                },
+            ]
+        })
+
+        tel = gk.enrich_api_keys_with_monitoring(
+            runner, records, lookback_days=14, now=ref_now
+        )
+        findings = gk.build_api_key_findings(
+            {"p-mixer": proj}, records, tel, lookback_days=14, now=ref_now
+        )
+        by_uid = {f.key_uid: f for f in findings}
+
+        self.assertEqual(
+            by_uid["uid-sweep-recent"].inference_activity_status,
+            "CONFIRMED_KEY_INFERENCE",
+        )
+        self.assertIn(
+            "POSSIBLE_VALIDATION_SWEEP_1_TO_10_CALLS",
+            by_uid["uid-sweep-recent"].gtig_threat_signals,
+        )
+        self.assertIn(
+            "RECENT_API_KEY_CREATED_IN_WINDOW",
+            by_uid["uid-sweep-recent"].gtig_threat_signals,
+        )
+
+        self.assertEqual(
+            by_uid["uid-recon-only"].inference_activity_status,
+            "RECON_SCOPING_DETECTED",
+        )
+        self.assertEqual(by_uid["uid-recon-only"].recon_calls_window, 6)
+        self.assertIn(
+            "TARGET_SCOPING_RECON(ListModels)",
+            by_uid["uid-recon-only"].gtig_threat_signals,
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

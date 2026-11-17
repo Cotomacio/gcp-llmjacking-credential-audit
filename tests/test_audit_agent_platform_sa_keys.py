@@ -181,6 +181,8 @@ class AuditAgentPlatformSaKeysTest(unittest.TestCase):
                 return []
             if args[:3] == ["recommender", "insights", "list"]:
                 return []
+            if args[:2] == ["logging", "read"]:
+                return []
             raise AssertionError(f"Unexpected command: {args}")
 
         def ts_handler(project_id: str, metric_filter: str, group_by: list[str]):
@@ -328,6 +330,320 @@ class AuditAgentPlatformSaKeysTest(unittest.TestCase):
         )
         self.assertEqual(len(findings), 1)
         self.assertEqual(findings[0].key_id, "quotafallbackkey")
+
+    def test_gtig_recon_validation_sweep_admin_activity_and_latent_enablement(self):
+        def handler(args: list[str]):
+            joined = " ".join(args)
+            if "--asset-types=cloudresourcemanager.googleapis.com/Project" in args:
+                return [
+                    {
+                        "name": "//cloudresourcemanager.googleapis.com/projects/proj-ai-active",
+                        "project": "projects/101",
+                        "organization": "organizations/900",
+                        "versionedResources": [{
+                            "resource": {
+                                "projectId": "proj-ai-active",
+                                "projectNumber": "101",
+                            }
+                        }],
+                    },
+                    {
+                        "name": "//cloudresourcemanager.googleapis.com/projects/proj-ai-dormant",
+                        "project": "projects/202",
+                        "organization": "organizations/900",
+                        "versionedResources": [{
+                            "resource": {
+                                "projectId": "proj-ai-dormant",
+                                "projectNumber": "202",
+                            }
+                        }],
+                    },
+                ]
+
+            if "--asset-types=serviceusage.googleapis.com/Service" in args:
+                return [{
+                    "name": "//serviceusage.googleapis.com/projects/101/services/aiplatform.googleapis.com",
+                    "project": "projects/101",
+                    "state": "ENABLED",
+                }]
+
+            if "--asset-types=iam.googleapis.com/ServiceAccount" in args:
+                return [
+                    {
+                        "name": "//iam.googleapis.com/projects/proj-ai-active/serviceAccounts/5001",
+                        "versionedResources": [{
+                            "resource": {
+                                "email": "sweep-sa@proj-ai-active.iam.gserviceaccount.com",
+                                "uniqueId": "5001",
+                            }
+                        }],
+                    },
+                    {
+                        "name": "//iam.googleapis.com/projects/proj-ai-active/serviceAccounts/5002",
+                        "versionedResources": [{
+                            "resource": {
+                                "email": "recon-sa@proj-ai-active.iam.gserviceaccount.com",
+                                "uniqueId": "5002",
+                            }
+                        }],
+                    },
+                    {
+                        "name": "//iam.googleapis.com/projects/proj-ai-dormant/serviceAccounts/5003",
+                        "versionedResources": [{
+                            "resource": {
+                                "email": "latent-editor@proj-ai-dormant.iam.gserviceaccount.com",
+                                "uniqueId": "5003",
+                            }
+                        }],
+                    },
+                    {
+                        "name": "//iam.googleapis.com/projects/proj-ai-dormant/serviceAccounts/5004",
+                        "versionedResources": [{
+                            "resource": {
+                                "email": "predict-only@proj-ai-dormant.iam.gserviceaccount.com",
+                                "uniqueId": "5004",
+                            }
+                        }],
+                    },
+                ]
+
+            if "--asset-types=iam.googleapis.com/ServiceAccountKey" in args:
+                return [
+                    {
+                        "name": "//iam.googleapis.com/projects/proj-ai-active/serviceAccounts/5001/keys/sweepkey111",
+                        "versionedResources": [{
+                            "resource": {
+                                "name": "projects/proj-ai-active/serviceAccounts/sweep-sa@proj-ai-active.iam.gserviceaccount.com/keys/sweepkey111",
+                                "keyType": "USER_MANAGED",
+                                "validAfterTime": "2026-11-12T10:00:00Z",
+                                "validBeforeTime": "9999-12-31T23:59:59Z",
+                            }
+                        }],
+                    },
+                    {
+                        "name": "//iam.googleapis.com/projects/proj-ai-active/serviceAccounts/5002/keys/reconkey222",
+                        "versionedResources": [{
+                            "resource": {
+                                "name": "projects/proj-ai-active/serviceAccounts/recon-sa@proj-ai-active.iam.gserviceaccount.com/keys/reconkey222",
+                                "keyType": "USER_MANAGED",
+                                "validAfterTime": "2025-02-01T00:00:00Z",
+                                "validBeforeTime": "9999-12-31T23:59:59Z",
+                            }
+                        }],
+                    },
+                    {
+                        "name": "//iam.googleapis.com/projects/proj-ai-dormant/serviceAccounts/5003/keys/latentkey333",
+                        "versionedResources": [{
+                            "resource": {
+                                "name": "projects/proj-ai-dormant/serviceAccounts/latent-editor@proj-ai-dormant.iam.gserviceaccount.com/keys/latentkey333",
+                                "keyType": "USER_MANAGED",
+                                "validAfterTime": "2025-03-01T00:00:00Z",
+                                "validBeforeTime": "9999-12-31T23:59:59Z",
+                            }
+                        }],
+                    },
+                    {
+                        "name": "//iam.googleapis.com/projects/proj-ai-dormant/serviceAccounts/5004/keys/ignoredkey444",
+                        "versionedResources": [{
+                            "resource": {
+                                "name": "projects/proj-ai-dormant/serviceAccounts/predict-only@proj-ai-dormant.iam.gserviceaccount.com/keys/ignoredkey444",
+                                "keyType": "USER_MANAGED",
+                                "validAfterTime": "2025-03-01T00:00:00Z",
+                                "validBeforeTime": "9999-12-31T23:59:59Z",
+                            }
+                        }],
+                    },
+                ]
+
+            if "analyze-iam-policy" in joined:
+                return {
+                    "fullyExplored": True,
+                    "mainAnalysis": {
+                        "fullyExplored": True,
+                        "analysisResults": [
+                            {
+                                "attachedResourceFullName": "//cloudresourcemanager.googleapis.com/projects/proj-ai-active",
+                                "iamBinding": {"role": "roles/aiplatform.user"},
+                                "accessControlLists": [{
+                                    "resources": [{
+                                        "fullResourceName": "//cloudresourcemanager.googleapis.com/projects/proj-ai-active"
+                                    }],
+                                    "accesses": [{"permission": "aiplatform.endpoints.predict"}],
+                                }],
+                                "identityList": {
+                                    "identities": [
+                                        {"name": "serviceAccount:sweep-sa@proj-ai-active.iam.gserviceaccount.com"},
+                                        {"name": "serviceAccount:recon-sa@proj-ai-active.iam.gserviceaccount.com"},
+                                    ]
+                                },
+                            },
+                            {
+                                "attachedResourceFullName": "//cloudresourcemanager.googleapis.com/projects/proj-ai-dormant",
+                                "iamBinding": {"role": "roles/editor"},
+                                "accessControlLists": [{
+                                    "resources": [{
+                                        "fullResourceName": "//cloudresourcemanager.googleapis.com/projects/proj-ai-dormant"
+                                    }],
+                                    "accesses": [
+                                        {"permission": "aiplatform.endpoints.predict"},
+                                        {"permission": "serviceusage.services.enable"},
+                                    ],
+                                }],
+                                "identityList": {
+                                    "identities": [{
+                                        "name": "serviceAccount:latent-editor@proj-ai-dormant.iam.gserviceaccount.com"
+                                    }]
+                                },
+                            },
+                            {
+                                "attachedResourceFullName": "//cloudresourcemanager.googleapis.com/projects/proj-ai-dormant",
+                                "iamBinding": {"role": "roles/aiplatform.user"},
+                                "accessControlLists": [{
+                                    "resources": [{
+                                        "fullResourceName": "//cloudresourcemanager.googleapis.com/projects/proj-ai-dormant"
+                                    }],
+                                    "accesses": [{"permission": "aiplatform.endpoints.predict"}],
+                                }],
+                                "identityList": {
+                                    "identities": [{
+                                        "name": "serviceAccount:predict-only@proj-ai-dormant.iam.gserviceaccount.com"
+                                    }]
+                                },
+                            },
+                        ],
+                    },
+                }
+
+            if "policy-intelligence query-activity" in joined:
+                return []
+            if args[:3] == ["recommender", "insights", "list"]:
+                return []
+            if args[:2] == ["logging", "read"]:
+                if "--project=proj-ai-active" in args:
+                    return [
+                        {
+                            "protoPayload": {
+                                "methodName": "google.api.serviceusage.v1.ServiceUsage.EnableService",
+                                "resourceName": "projects/101/services/aiplatform.googleapis.com",
+                                "authenticationInfo": {
+                                    "principalEmail": "sweep-sa@proj-ai-active.iam.gserviceaccount.com"
+                                },
+                            }
+                        },
+                        {
+                            "protoPayload": {
+                                "methodName": "google.iam.admin.v1.CreateServiceAccountKey",
+                                "authenticationInfo": {
+                                    "principalEmail": "sweep-sa@proj-ai-active.iam.gserviceaccount.com"
+                                },
+                            }
+                        },
+                    ]
+                return []
+            raise AssertionError(f"Unexpected command: {args}")
+
+        def ts_handler(project_id: str, metric_filter: str, group_by: list[str]):
+            if "serviceruntime.googleapis.com/api/request_count" in metric_filter:
+                if project_id == "proj-ai-active":
+                    return [
+                        {
+                            "resource": {
+                                "labels": {
+                                    "credential_id": "serviceaccount:5001",
+                                    "method": "google.cloud.aiplatform.v1.PredictionService.GenerateContent",
+                                }
+                            },
+                            "metric": {"labels": {"response_code_class": "2xx"}},
+                            "points": [{"value": {"int64Value": "3"}}],
+                        },
+                        {
+                            "resource": {
+                                "labels": {
+                                    "credential_id": "serviceaccount:5002",
+                                    "method": "google.cloud.aiplatform.v1.PublisherModelService.ListPublisherModels",
+                                }
+                            },
+                            "metric": {"labels": {"response_code_class": "2xx"}},
+                            "points": [{"value": {"int64Value": "4"}}],
+                        },
+                    ]
+                return []
+
+            if "iam.googleapis.com/service_account/key/authn_events_count" in metric_filter:
+                if project_id == "proj-ai-active":
+                    return [
+                        {
+                            "resource": {"labels": {"unique_id": "5001"}},
+                            "metric": {"labels": {"key_id": "sweepkey111"}},
+                            "points": [{"value": {"int64Value": "3"}}],
+                        },
+                        {
+                            "resource": {"labels": {"unique_id": "5002"}},
+                            "metric": {"labels": {"key_id": "reconkey222"}},
+                            "points": [{"value": {"int64Value": "2"}}],
+                        },
+                    ]
+                return []
+            return []
+
+        runner = FakeGcloudRunner(handler, ts_handler)
+        p_map, k_map, grants, scanned, email_uid = audit.run_cai_discovery(
+            runner, scope="organizations/900", include_can_enable_ai=True
+        )
+        findings = audit.build_findings(
+            runner=runner,
+            id_to_proj=p_map,
+            sa_to_keys=k_map,
+            grants=grants,
+            scanned_project_ids=scanned,
+            email_to_unique_id=email_uid,
+            lookback_days=14,
+            now=REF_NOW,
+        )
+        by_key = {f.key_id: f for f in findings}
+
+        # predict-only SA on dormant project cannot enable AI API -> must be excluded
+        self.assertNotIn("ignoredkey444", by_key)
+        self.assertEqual(len(by_key), 3)
+
+        # 1) Validation sweep + recent key + Admin Activity signals
+        sweep_f = by_key["sweepkey111"]
+        self.assertEqual(
+            sweep_f.inference_activity_status, "CONFIRMED_KEY_INFERENCE"
+        )
+        self.assertIn(
+            "POSSIBLE_VALIDATION_SWEEP_1_TO_10_CALLS",
+            sweep_f.gtig_threat_signals,
+        )
+        self.assertIn(
+            "RECENT_KEY_CREATED_IN_WINDOW", sweep_f.gtig_threat_signals
+        )
+        self.assertIn(
+            "SA_ADMIN_ACTION:CreateServiceAccountKey@proj-ai-active",
+            sweep_f.gtig_threat_signals,
+        )
+        self.assertIn(
+            "RECENT_AI_API_ENABLED:proj-ai-active",
+            sweep_f.gtig_threat_signals,
+        )
+
+        # 2) Target Scoping / Recon only (ListPublisherModels)
+        recon_f = by_key["reconkey222"]
+        self.assertEqual(
+            recon_f.inference_activity_status, "RECON_SCOPING_ACTIVE_KEY"
+        )
+        self.assertEqual(recon_f.sa_recon_calls_window, 4)
+        self.assertIn(
+            "TARGET_SCOPING_RECON(ListPublisherModels)",
+            recon_f.gtig_threat_signals,
+        )
+
+        # 3) Latent AI enablement on dormant project
+        latent_f = by_key["latentkey333"]
+        self.assertEqual(latent_f.access_paths, ["LATENT_CAN_ENABLE_AI"])
+        self.assertIn(
+            "LATENT_CAN_ENABLE_AI_API", latent_f.gtig_threat_signals
+        )
 
 
 if __name__ == "__main__":
